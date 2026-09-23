@@ -444,6 +444,16 @@ impl LocalParticipant {
                 });
             }
         }
+        if let Some(min_bitrate) = options.min_bitrate {
+            if let Some(lowest) = encodings.iter_mut().min_by_key(|encoding| encoding.max_bitrate.unwrap_or(u64::MAX)) {
+                lowest.min_bitrate = Some(min_bitrate);
+            }
+        }
+        if let Some(priority) = options.bitrate_priority {
+            for encoding in encodings.iter_mut() {
+                encoding.bitrate_priority = Some(priority);
+            }
+        }
         let track_info = self.inner.rtc_engine.add_track(req).await?;
         let publication = LocalTrackPublication::new(track_info.clone(), track.clone());
         track.update_info(track_info); // Update sid + source

@@ -132,6 +132,8 @@ pub struct RtcpParameters {
 pub struct RtpEncodingParameters {
     pub active: bool,
     pub max_bitrate: Option<u64>,
+    pub min_bitrate: Option<u64>,
+    pub bitrate_priority: Option<f64>,
     pub max_framerate: Option<f64>,
     pub priority: Priority,
     pub rid: String,
@@ -169,6 +171,8 @@ impl Default for RtpEncodingParameters {
         Self {
             active: true,
             max_bitrate: None,
+            min_bitrate: None,
+            bitrate_priority: None,
             max_framerate: None,
             priority: Priority::Low,
             rid: String::default(),

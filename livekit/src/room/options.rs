@@ -139,6 +139,8 @@ pub struct TrackPublishOptions {
     /// encoding is produced and that mode is forwarded to libwebrtc to
     /// enable true SVC for VP9/AV1. Has no effect for VP8/H264.
     pub scalability_mode: Option<String>,
+    pub min_bitrate: Option<u64>,
+    pub bitrate_priority: Option<f64>,
     /// Controls how the encoder trades off between resolution and framerate
     /// when bandwidth is constrained.
     ///
@@ -169,6 +171,8 @@ impl Default for TrackPublishOptions {
             frame_metadata_features: FrameMetadataFeatures::default(),
             video_encoder: VideoEncoderBackend::Auto,
             scalability_mode: None,
+            min_bitrate: None,
+            bitrate_priority: None,
             degradation_preference: None,
         }
     }

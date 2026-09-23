@@ -74,6 +74,17 @@ pub mod ffi {
         pub timestamp_us: i64,
     }
 
+    /// One simulcast layer of an encoded frame: a slice of the frame's
+    /// payload. `size == 0` means the layer was not encoded for this frame.
+    #[derive(Debug)]
+    pub struct EncodedLayerData {
+        pub width: i32,
+        pub height: i32,
+        pub frame_type: EncodedFrameType,
+        pub offset: usize,
+        pub size: usize,
+    }
+
     #[derive(Debug)]
     pub struct EncodedRateControlRequest {
         pub has_request: bool,
@@ -124,8 +135,21 @@ pub mod ffi {
             payload: &[u8],
             frame_metadata: &FrameMetadata,
         ) -> bool;
+        fn capture_encoded_layers(
+            self: &VideoTrackSource,
+            frame: &EncodedVideoFrameData,
+            layers: &[EncodedLayerData],
+            payload: &[u8],
+            frame_metadata: &FrameMetadata,
+        ) -> bool;
         fn take_keyframe_request(self: &VideoTrackSource) -> bool;
         fn take_rate_control_request(self: &VideoTrackSource) -> EncodedRateControlRequest;
+        fn take_layer_keyframe_request(self: &VideoTrackSource, layer: usize) -> bool;
+        fn take_layer_rate_control_request(
+            self: &VideoTrackSource,
+            layer: usize,
+        ) -> EncodedRateControlRequest;
+        fn layer_idle_ms(self: &VideoTrackSource, layer: usize) -> i64;
         fn set_packet_trailer_handler(
             self: &VideoTrackSource,
             handler: SharedPtr<PacketTrailerHandler>,

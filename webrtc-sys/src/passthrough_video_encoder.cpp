@@ -197,6 +197,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
     }
     codec_ = *codec_settings;
+    chain_intact_ = false;
+    has_previous_frame_ = false;
     cached_sequence_header_obu_.clear();
     av1_svc_controller_ = ScalableVideoControllerNoLayering();
     if (IsAv1Codec(codec_type_) && !codec_.GetScalabilityMode().has_value()) {
@@ -239,9 +241,22 @@ class PassthroughVideoEncoder final : public VideoEncoder {
           << "PassthroughVideoEncoder frame codec does not match sender codec";
       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
     }
-    ForwardPendingRateControl(encoded_buffer);
+    if (encoded_buffer->layers().empty()) {
+      RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder received a frame without "
+                           "encoded layers";
+      return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+    }
 
-    const bool is_keyframe = IsKeyframe(encoded_buffer->frame_type());
+    // Under simulcast every layer's encoder gets the same frame; this one
+    // sends the layer it was configured for.
+    const size_t layer_index =
+        encoded_buffer->LayerIndexFor(codec_.width, codec_.height);
+    const livekit::EncodedLayer& layer = encoded_buffer->layers()[layer_index];
+    encoded_buffer->mark_wanted(layer_index);
+    ForwardPendingRateControl(encoded_buffer, layer_index);
+
+    const bool has_payload = layer.payload && layer.payload->size() > 0;
+    const bool is_keyframe = has_payload && IsKeyframe(layer.frame_type);
 
     // A pass-through cannot synthesize the keyframe the RTP layer wants
     // (PLI/FIR, late subscriber, reconfiguration); forward the request to
@@ -253,21 +268,26 @@ class PassthroughVideoEncoder final : public VideoEncoder {
                       return type == VideoFrameType::kVideoFrameKey;
                     });
     if (keyframe_requested && !is_keyframe) {
-      encoded_buffer->request_keyframe();
+      encoded_buffer->request_keyframe(layer_index);
+    }
+
+    if (!has_payload) {
+      if (encoded_buffer->layers().size() == 1) {
+        RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder received an empty frame";
+        chain_intact_ = false;
+        return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+      }
+      chain_intact_ = false;
+      encoded_buffer->request_keyframe(layer_index);
+      return WEBRTC_VIDEO_CODEC_OK;
     }
 
     if (!ContinuesChain(*encoded_buffer, is_keyframe)) {
-      encoded_buffer->request_keyframe();
+      encoded_buffer->request_keyframe(layer_index);
       encoded_image_callback_->OnFrameDropped(frame.rtp_timestamp(),
                                               /*spatial_id=*/0,
                                               /*is_end_of_temporal_unit=*/true);
       return WEBRTC_VIDEO_CODEC_OK;
-    }
-
-    if (encoded_buffer->payload_size() == 0) {
-      RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder received an empty frame";
-      chain_intact_ = false;
-      return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
     }
 
     // Non-AV1 payloads are forwarded without copying: the buffer already
@@ -275,9 +295,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
     // may rewrite the bytes, so it works on a copy.
     webrtc::scoped_refptr<webrtc::EncodedImageBufferInterface> encoded_data;
     if (IsAv1Codec(codec_type_)) {
-      std::vector<uint8_t> payload(
-          encoded_buffer->payload_data(),
-          encoded_buffer->payload_data() + encoded_buffer->payload_size());
+      std::vector<uint8_t> payload(layer.payload->data(),
+                                   layer.payload->data() + layer.payload->size());
       livekit::av1::NormalizeForRtp(&payload);
 
       std::vector<uint8_t> sequence_header;
@@ -298,12 +317,12 @@ class PassthroughVideoEncoder final : public VideoEncoder {
       }
       encoded_data = EncodedImageBuffer::Create(payload.data(), payload.size());
     } else {
-      encoded_data = encoded_buffer->encoded_data();
+      encoded_data = layer.payload;
     }
 
     EncodedImage encoded_image;
-    encoded_image._encodedWidth = encoded_buffer->width();
-    encoded_image._encodedHeight = encoded_buffer->height();
+    encoded_image._encodedWidth = layer.width;
+    encoded_image._encodedHeight = layer.height;
     encoded_image.SetRtpTimestamp(frame.rtp_timestamp());
     encoded_image.SetSimulcastIndex(0);
     encoded_image.ntp_time_ms_ = frame.ntp_time_ms();
@@ -311,7 +330,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
     encoded_image.rotation_ = frame.rotation();
     encoded_image.content_type_ = webrtc::VideoContentType::UNSPECIFIED;
     encoded_image.timing_.flags = webrtc::VideoSendTiming::kInvalid;
-    encoded_image._frameType = FrameTypeFromBuffer(encoded_buffer->frame_type());
+    encoded_image._frameType = FrameTypeFromBuffer(layer.frame_type);
     encoded_image.SetColorSpace(frame.color_space());
     const size_t encoded_size = encoded_data->size();
     encoded_image.SetEncodedData(std::move(encoded_data));
@@ -320,8 +339,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
 
     CodecSpecificInfo codec_info;
     codec_info.codecSpecific = {};
-    FillSingleLayerCodecSpecific(&codec_info, codec_type_, encoded_buffer->width(),
-                                 encoded_buffer->height(), is_keyframe,
+    FillSingleLayerCodecSpecific(&codec_info, codec_type_, layer.width,
+                                 layer.height, is_keyframe,
                                  &av1_svc_controller_);
 
     const auto result =
@@ -377,8 +396,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
     return chain_intact_;
   }
 
-  void ForwardPendingRateControl(
-      EncodedVideoFrameBuffer* encoded_buffer) {
+  void ForwardPendingRateControl(EncodedVideoFrameBuffer* encoded_buffer,
+                                 size_t layer_index) {
     std::optional<livekit::EncodedRateControlRequest> request;
     {
       webrtc::MutexLock lock(&rate_control_mutex_);
@@ -386,8 +405,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
       latest_rate_control_request_.reset();
     }
     if (request.has_value()) {
-      encoded_buffer->set_rate_control_request(request->target_bitrate_bps,
-                                               request->framerate_fps);
+      encoded_buffer->set_rate_control_request(
+          layer_index, request->target_bitrate_bps, request->framerate_fps);
     }
   }
 
@@ -500,7 +519,7 @@ rust::Vec<uint8_t> passthrough_chain_guard_for_test(
   encoder.RegisterEncodeCompleteCallback(&callback);
 
   const uint8_t stream = 0;
-  auto keyframe_request = std::make_shared<std::atomic<bool>>(false);
+  auto signals = std::make_shared<livekit::EncodedLayerSignals>();
   const uint8_t payload[] = {0, 0, 0, 1, 0x65, 0x88};
   uint64_t sequence_number = 0;
   uint32_t rtp_timestamp = 0;
@@ -514,7 +533,7 @@ rust::Vec<uint8_t> passthrough_chain_guard_for_test(
         64, 64, livekit::EncodedVideoCodec::kH264,
         kind == kChainTestKey ? livekit::EncodedFrameType::kKey
                               : livekit::EncodedFrameType::kDelta,
-        EncodedImageBuffer::Create(payload, sizeof(payload)), keyframe_request);
+        EncodedImageBuffer::Create(payload, sizeof(payload)), signals);
     buffer->set_stream_position(&stream, sequence);
     VideoFrame frame = VideoFrame::Builder()
                            .set_video_frame_buffer(buffer)
@@ -526,7 +545,7 @@ rust::Vec<uint8_t> passthrough_chain_guard_for_test(
     if (callback.sent > sent_before) {
       result |= kChainTestSent;
     }
-    if (keyframe_request->exchange(false)) {
+    if (signals->TakeKeyframeRequest(0)) {
       result |= kChainTestKeyframeRequested;
     }
     results.push_back(result);

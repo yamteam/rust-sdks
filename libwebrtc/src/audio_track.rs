@@ -26,6 +26,10 @@ pub struct RtcAudioTrack {
 
 impl RtcAudioTrack {
     media_stream_track!();
+
+    pub fn set_volume(&self, volume: f64) {
+        self.handle.set_volume(volume)
+    }
 }
 
 impl Debug for RtcAudioTrack {

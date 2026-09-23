@@ -942,6 +942,18 @@ impl PlatformAudio {
         self.handle.runtime.recording_is_initialized()
     }
 
+    /// Enables or disables microphone capture through the platform ADM.
+    ///
+    /// [`PlatformAudio::new`] enables it. An application that captures the
+    /// microphone itself and publishes it through a `NativeAudioSource`, and
+    /// uses `PlatformAudio` only for playout, should disable it: otherwise
+    /// the ADM keeps the default microphone open and its capture thread feeds
+    /// every sending audio stream, including while streams are torn down.
+    pub fn set_recording_enabled(&self, enabled: bool) {
+        self.handle.runtime.set_adm_recording_enabled(enabled);
+        log::info!("PlatformAudio: ADM recording {}", if enabled { "enabled" } else { "disabled" });
+    }
+
     // =========================================================================
     // Lifecycle Management
     // =========================================================================

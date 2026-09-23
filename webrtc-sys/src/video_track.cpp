@@ -278,7 +278,47 @@ bool VideoTrackSource::capture_encoded_frame(
       width, height, ToNativeEncodedCodec(encoded_frame.codec),
       ToNativeEncodedFrameType(encoded_frame.frame_type),
       webrtc::EncodedImageBuffer::Create(payload.data(), payload.size()),
-      source_->keyframe_request_flag(), source_->rate_control_state());
+      source_->encoded_signals(), source_->next_encoded_sequence(0));
+
+  auto frame = webrtc::VideoFrame::Builder()
+                   .set_video_frame_buffer(std::move(buffer))
+                   .set_rotation(webrtc::kVideoRotation_0)
+                   .set_timestamp_us(encoded_frame.timestamp_us)
+                   .build();
+
+  return source_->on_captured_frame(frame, frame_metadata);
+}
+
+bool VideoTrackSource::capture_encoded_layers(
+    const EncodedVideoFrameData& encoded_frame,
+    rust::Slice<const EncodedLayerData> layers,
+    rust::Slice<const uint8_t> payload,
+    const FrameMetadata& frame_metadata) const {
+  if (layers.empty() || layers.size() > livekit::kMaxEncodedLayers) {
+    return false;
+  }
+  std::vector<livekit::EncodedLayer> native_layers;
+  native_layers.reserve(layers.size());
+  for (size_t i = 0; i < layers.size(); ++i) {
+    const EncodedLayerData& layer = layers[i];
+    if (layer.offset > payload.size() ||
+        layer.size > payload.size() - layer.offset) {
+      return false;
+    }
+    livekit::EncodedLayer native;
+    native.width = layer.width;
+    native.height = layer.height;
+    native.frame_type = ToNativeEncodedFrameType(layer.frame_type);
+    if (layer.size > 0) {
+      native.payload = webrtc::EncodedImageBuffer::Create(
+          payload.data() + layer.offset, layer.size);
+      native.sequence = source_->next_encoded_sequence(i);
+    }
+    native_layers.push_back(std::move(native));
+  }
+  auto buffer = webrtc::make_ref_counted<livekit::EncodedVideoFrameBuffer>(
+      ToNativeEncodedCodec(encoded_frame.codec), std::move(native_layers),
+      source_->encoded_signals());
 
   auto frame = webrtc::VideoFrame::Builder()
                    .set_video_frame_buffer(std::move(buffer))
@@ -290,15 +330,27 @@ bool VideoTrackSource::capture_encoded_frame(
 }
 
 bool VideoTrackSource::take_keyframe_request() const {
-  return source_->keyframe_request_flag()->exchange(false,
-                                                    std::memory_order_relaxed);
+  return take_layer_keyframe_request(0);
 }
 
 EncodedRateControlRequest VideoTrackSource::take_rate_control_request() const {
-  auto request = source_->rate_control_state()->Take();
+  return take_layer_rate_control_request(0);
+}
+
+bool VideoTrackSource::take_layer_keyframe_request(size_t layer) const {
+  return source_->encoded_signals()->TakeKeyframeRequest(layer);
+}
+
+EncodedRateControlRequest VideoTrackSource::take_layer_rate_control_request(
+    size_t layer) const {
+  auto request = source_->encoded_signals()->TakeRate(layer);
   return EncodedRateControlRequest{request.has_request,
                                    request.target_bitrate_bps,
                                    request.framerate_fps};
+}
+
+int64_t VideoTrackSource::layer_idle_ms(size_t layer) const {
+  return source_->encoded_signals()->MillisSinceWanted(layer);
 }
 
 void VideoTrackSource::set_packet_trailer_handler(

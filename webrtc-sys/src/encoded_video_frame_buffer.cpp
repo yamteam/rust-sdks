@@ -16,12 +16,24 @@
 
 #include "livekit/encoded_video_frame_buffer.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <utility>
 
 #include "api/video/i420_buffer.h"
 #include "rtc_base/logging.h"
 
 namespace livekit {
+
+namespace {
+
+int64_t NowMillis() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace
 
 void EncodedRateControlState::Store(uint64_t target_bitrate_bps,
                                     double framerate_fps) {
@@ -38,32 +50,75 @@ EncodedRateControlRequest EncodedRateControlState::Take() {
   return request;
 }
 
+void EncodedLayerSignals::RequestKeyframe(size_t layer) {
+  if (layer < kMaxEncodedLayers) {
+    keyframe_[layer].store(true, std::memory_order_relaxed);
+  }
+}
+
+bool EncodedLayerSignals::TakeKeyframeRequest(size_t layer) {
+  return layer < kMaxEncodedLayers &&
+         keyframe_[layer].exchange(false, std::memory_order_relaxed);
+}
+
+void EncodedLayerSignals::StoreRate(size_t layer,
+                                    uint64_t target_bitrate_bps,
+                                    double framerate_fps) {
+  if (layer < kMaxEncodedLayers) {
+    rates_[layer].Store(target_bitrate_bps, framerate_fps);
+  }
+}
+
+EncodedRateControlRequest EncodedLayerSignals::TakeRate(size_t layer) {
+  if (layer >= kMaxEncodedLayers) {
+    return EncodedRateControlRequest();
+  }
+  return rates_[layer].Take();
+}
+
+void EncodedLayerSignals::MarkWanted(size_t layer) {
+  if (layer < kMaxEncodedLayers) {
+    wanted_ms_[layer].store(NowMillis(), std::memory_order_relaxed);
+  }
+}
+
+int64_t EncodedLayerSignals::MillisSinceWanted(size_t layer) const {
+  if (layer >= kMaxEncodedLayers) {
+    return -1;
+  }
+  const int64_t wanted = wanted_ms_[layer].load(std::memory_order_relaxed);
+  return wanted == 0 ? -1 : NowMillis() - wanted;
+}
+
 EncodedVideoFrameBuffer::EncodedVideoFrameBuffer(
     int width,
     int height,
     EncodedVideoCodec codec,
     EncodedFrameType frame_type,
     webrtc::scoped_refptr<webrtc::EncodedImageBuffer> payload,
-    std::shared_ptr<std::atomic<bool>> keyframe_request_flag,
-    std::shared_ptr<EncodedRateControlState> rate_control_state)
-    : width_(width),
-      height_(height),
-      codec_(codec),
-      frame_type_(frame_type),
-      payload_(std::move(payload)),
-      keyframe_request_flag_(std::move(keyframe_request_flag)),
-      rate_control_state_(std::move(rate_control_state)) {}
+    std::shared_ptr<EncodedLayerSignals> signals,
+    uint64_t sequence)
+    : codec_(codec), signals_(std::move(signals)) {
+  layers_.push_back(EncodedLayer{width, height, frame_type, std::move(payload),
+                                 sequence});
+}
+
+EncodedVideoFrameBuffer::EncodedVideoFrameBuffer(
+    EncodedVideoCodec codec,
+    std::vector<EncodedLayer> layers,
+    std::shared_ptr<EncodedLayerSignals> signals)
+    : codec_(codec), layers_(std::move(layers)), signals_(std::move(signals)) {}
 
 webrtc::VideoFrameBuffer::Type EncodedVideoFrameBuffer::type() const {
   return Type::kNative;
 }
 
 int EncodedVideoFrameBuffer::width() const {
-  return width_;
+  return layers_.empty() ? 0 : layers_.back().width;
 }
 
 int EncodedVideoFrameBuffer::height() const {
-  return height_;
+  return layers_.empty() ? 0 : layers_.back().height;
 }
 
 webrtc::scoped_refptr<webrtc::I420BufferInterface>
@@ -78,7 +133,7 @@ EncodedVideoFrameBuffer::ToI420() {
                            "encoded access unit; returning black frames";
   }
   webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
-      webrtc::I420Buffer::Create(width_, height_);
+      webrtc::I420Buffer::Create(width(), height());
   webrtc::I420Buffer::SetBlack(buffer.get());
   return buffer;
 }
@@ -98,17 +153,40 @@ EncodedVideoFrameBuffer::CropAndScale(int /* offset_x */,
   return webrtc::scoped_refptr<webrtc::VideoFrameBuffer>(this);
 }
 
-void EncodedVideoFrameBuffer::request_keyframe() const {
-  if (keyframe_request_flag_) {
-    keyframe_request_flag_->store(true, std::memory_order_relaxed);
+size_t EncodedVideoFrameBuffer::LayerIndexFor(int width, int height) const {
+  size_t best = layers_.empty() ? 0 : layers_.size() - 1;
+  int64_t best_distance = -1;
+  const int64_t area = static_cast<int64_t>(width) * height;
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    const int64_t distance =
+        std::llabs(static_cast<int64_t>(layers_[i].width) * layers_[i].height -
+                   area);
+    if (best_distance < 0 || distance < best_distance) {
+      best = i;
+      best_distance = distance;
+    }
+  }
+  return best;
+}
+
+void EncodedVideoFrameBuffer::request_keyframe(size_t layer) const {
+  if (signals_) {
+    signals_->RequestKeyframe(layer);
   }
 }
 
 void EncodedVideoFrameBuffer::set_rate_control_request(
+    size_t layer,
     uint64_t target_bitrate_bps,
     double framerate_fps) const {
-  if (rate_control_state_) {
-    rate_control_state_->Store(target_bitrate_bps, framerate_fps);
+  if (signals_) {
+    signals_->StoreRate(layer, target_bitrate_bps, framerate_fps);
+  }
+}
+
+void EncodedVideoFrameBuffer::mark_wanted(size_t layer) const {
+  if (signals_) {
+    signals_->MarkWanted(layer);
   }
 }
 

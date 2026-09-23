@@ -108,13 +108,17 @@ class VideoTrackSource {
         std::shared_ptr<PacketTrailerHandler> handler);
 
     // Shared with every EncodedVideoFrameBuffer this source emits; the
-    // pass-through encoder raises it on unsatisfied keyframe requests.
-    std::shared_ptr<std::atomic<bool>> keyframe_request_flag() const {
-      return keyframe_request_flag_;
+    // pass-through encoders raise keyframe requests and rate targets there.
+    std::shared_ptr<livekit::EncodedLayerSignals> encoded_signals() const {
+      return encoded_signals_;
     }
-    std::shared_ptr<livekit::EncodedRateControlState> rate_control_state()
-        const {
-      return rate_control_state_;
+    // Encoded access units are numbered per simulcast layer.
+    uint64_t next_encoded_sequence(size_t layer) {
+      if (layer >= livekit::kMaxEncodedLayers) {
+        return 0;
+      }
+      return encoded_sequences_[layer].fetch_add(1, std::memory_order_relaxed) +
+             1;
     }
 
    private:
@@ -122,10 +126,10 @@ class VideoTrackSource {
     webrtc::TimestampAligner timestamp_aligner_;
     VideoResolution resolution_;
     std::shared_ptr<PacketTrailerHandler> packet_trailer_handler_;
-    std::shared_ptr<std::atomic<bool>> keyframe_request_flag_ =
-        std::make_shared<std::atomic<bool>>(false);
-    std::shared_ptr<livekit::EncodedRateControlState> rate_control_state_ =
-        std::make_shared<livekit::EncodedRateControlState>();
+    std::shared_ptr<livekit::EncodedLayerSignals> encoded_signals_ =
+        std::make_shared<livekit::EncodedLayerSignals>();
+    std::array<std::atomic<uint64_t>, livekit::kMaxEncodedLayers>
+        encoded_sequences_{};
     bool is_screencast_;
   };
 
@@ -144,11 +148,24 @@ class VideoTrackSource {
                              rust::Slice<const uint8_t> payload,
                              const FrameMetadata& frame_metadata) const;
 
+  // One frame with an access unit per simulcast layer, lowest first.
+  // `layers` describe slices of `payload`; a layer with size 0 was not
+  // encoded for this frame.
+  bool capture_encoded_layers(const EncodedVideoFrameData& frame,
+                              rust::Slice<const EncodedLayerData> layers,
+                              rust::Slice<const uint8_t> payload,
+                              const FrameMetadata& frame_metadata) const;
+
   // Returns and clears the pending upstream keyframe request raised by the
   // pass-through encoder (PLI/FIR or post-reconfigure). Poll from the
   // capture loop.
   bool take_keyframe_request() const;
   EncodedRateControlRequest take_rate_control_request() const;
+  bool take_layer_keyframe_request(size_t layer) const;
+  EncodedRateControlRequest take_layer_rate_control_request(
+      size_t layer) const;
+  // Milliseconds since libwebrtc last asked for `layer`, -1 if never.
+  int64_t layer_idle_ms(size_t layer) const;
 
   void set_packet_trailer_handler(
       std::shared_ptr<PacketTrailerHandler> handler) const;

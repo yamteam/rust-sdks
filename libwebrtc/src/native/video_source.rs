@@ -26,7 +26,7 @@ use webrtc_sys::{video_frame as vf_sys, video_frame::ffi::VideoRotation, video_t
 
 use crate::{
     native::packet_trailer::PacketTrailerHandler,
-    video_frame::{EncodedVideoFrame, I420Buffer, VideoBuffer, VideoFrame},
+    video_frame::{EncodedSimulcastFrame, EncodedVideoFrame, I420Buffer, VideoBuffer, VideoFrame},
     video_source::{EncodedRateControl, VideoResolution},
 };
 
@@ -211,6 +211,79 @@ impl NativeVideoSource {
                 user_data,
             },
         )
+    }
+
+    pub fn capture_encoded_simulcast(&self, frame: &EncodedSimulcastFrame<'_>) -> bool {
+        let (has_trailer, user_ts, fid, user_data) = match &frame.frame_metadata {
+            Some(meta) => (
+                true,
+                meta.user_timestamp.unwrap_or(0),
+                meta.frame_id.unwrap_or(0),
+                meta.user_data.clone().unwrap_or_default(),
+            ),
+            None => (false, 0, 0, Vec::new()),
+        };
+
+        let capture_ts = if frame.timestamp_us == 0 {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            now.as_micros() as i64
+        } else {
+            frame.timestamp_us
+        };
+
+        // One contiguous payload with the layers as slices of it: one copy
+        // here, none after (the native side shares each slice's buffer with
+        // its pass-through encoder).
+        let mut payload = Vec::with_capacity(frame.layers.iter().map(|layer| layer.payload.len()).sum());
+        let layers: Vec<vt_sys::ffi::EncodedLayerData> = frame
+            .layers
+            .iter()
+            .map(|layer| {
+                let offset = payload.len();
+                payload.extend_from_slice(layer.payload);
+                vt_sys::ffi::EncodedLayerData {
+                    width: layer.resolution.width as i32,
+                    height: layer.resolution.height as i32,
+                    frame_type: layer.frame_type.into(),
+                    offset,
+                    size: layer.payload.len(),
+                }
+            })
+            .collect();
+
+        self.captured_frames.fetch_add(1, Ordering::Relaxed);
+        self.sys_handle.capture_encoded_layers(
+            &vt_sys::ffi::EncodedVideoFrameData {
+                codec: frame.codec.into(),
+                frame_type: vt_sys::ffi::EncodedFrameType::Delta,
+                timestamp_us: capture_ts,
+            },
+            &layers,
+            &payload,
+            &vt_sys::ffi::FrameMetadata {
+                has_packet_trailer: has_trailer,
+                user_timestamp: user_ts,
+                frame_id: fid,
+                user_data,
+            },
+        )
+    }
+
+    pub fn take_layer_keyframe_request(&self, layer: usize) -> bool {
+        self.sys_handle.take_layer_keyframe_request(layer)
+    }
+
+    pub fn take_layer_rate_control_request(&self, layer: usize) -> Option<EncodedRateControl> {
+        let request = self.sys_handle.take_layer_rate_control_request(layer);
+        request.has_request.then_some(EncodedRateControl {
+            target_bitrate_bps: request.target_bitrate_bps,
+            framerate_fps: request.framerate_fps,
+        })
+    }
+
+    pub fn layer_idle(&self, layer: usize) -> Option<std::time::Duration> {
+        let idle = self.sys_handle.layer_idle_ms(layer);
+        (idle >= 0).then(|| std::time::Duration::from_millis(idle as u64))
     }
 
     /// Returns and clears the pending keyframe request raised by the

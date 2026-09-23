@@ -193,6 +193,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
     }
     codec_ = *codec_settings;
+    awaiting_keyframe_ = true;
+    last_sequence_ = 0;
     cached_sequence_header_obu_.clear();
     av1_svc_controller_ = ScalableVideoControllerNoLayering();
     if (IsAv1Codec(codec_type_) && !codec_.GetScalabilityMode().has_value()) {
@@ -235,9 +237,22 @@ class PassthroughVideoEncoder final : public VideoEncoder {
           << "PassthroughVideoEncoder frame codec does not match sender codec";
       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
     }
-    ForwardPendingRateControl(encoded_buffer);
+    if (encoded_buffer->layers().empty()) {
+      RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder received a frame without "
+                           "encoded layers";
+      return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+    }
 
-    const bool is_keyframe = IsKeyframe(encoded_buffer->frame_type());
+    // Under simulcast every layer's encoder gets the same frame; this one
+    // sends the layer it was configured for.
+    const size_t layer_index =
+        encoded_buffer->LayerIndexFor(codec_.width, codec_.height);
+    const livekit::EncodedLayer& layer = encoded_buffer->layers()[layer_index];
+    encoded_buffer->mark_wanted(layer_index);
+    ForwardPendingRateControl(encoded_buffer, layer_index);
+
+    const bool has_payload = layer.payload && layer.payload->size() > 0;
+    const bool is_keyframe = has_payload && IsKeyframe(layer.frame_type);
 
     // A pass-through cannot synthesize the keyframe the RTP layer wants
     // (PLI/FIR, late subscriber, reconfiguration); forward the request to
@@ -249,12 +264,35 @@ class PassthroughVideoEncoder final : public VideoEncoder {
                       return type == VideoFrameType::kVideoFrameKey;
                     });
     if (keyframe_requested && !is_keyframe) {
-      encoded_buffer->request_keyframe();
+      encoded_buffer->request_keyframe(layer_index);
     }
 
-    if (encoded_buffer->payload_size() == 0) {
-      RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder received an empty frame";
-      return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+    // A simulcast layer the capture side did not encode for this frame (it
+    // was paused, or the upstream encoder dropped it): the next frame of
+    // this layer needs a keyframe. A single-layer frame is never empty.
+    if (!has_payload) {
+      if (encoded_buffer->layers().size() == 1) {
+        RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder received an empty frame";
+        return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+      }
+      awaiting_keyframe_ = true;
+      encoded_buffer->request_keyframe(layer_index);
+      return WEBRTC_VIDEO_CODEC_OK;
+    }
+
+    const uint64_t sequence = layer.sequence;
+    if (sequence != 0) {
+      if (last_sequence_ != 0 && sequence != last_sequence_ + 1) {
+        awaiting_keyframe_ = true;
+      }
+      last_sequence_ = sequence;
+    }
+    if (awaiting_keyframe_) {
+      if (!is_keyframe) {
+        encoded_buffer->request_keyframe(layer_index);
+        return WEBRTC_VIDEO_CODEC_OK;
+      }
+      awaiting_keyframe_ = false;
     }
 
     // Non-AV1 payloads are forwarded without copying: the buffer already
@@ -262,9 +300,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
     // may rewrite the bytes, so it works on a copy.
     webrtc::scoped_refptr<webrtc::EncodedImageBufferInterface> encoded_data;
     if (IsAv1Codec(codec_type_)) {
-      std::vector<uint8_t> payload(
-          encoded_buffer->payload_data(),
-          encoded_buffer->payload_data() + encoded_buffer->payload_size());
+      std::vector<uint8_t> payload(layer.payload->data(),
+                                   layer.payload->data() + layer.payload->size());
       livekit::av1::NormalizeForRtp(&payload);
 
       std::vector<uint8_t> sequence_header;
@@ -284,12 +321,12 @@ class PassthroughVideoEncoder final : public VideoEncoder {
       }
       encoded_data = EncodedImageBuffer::Create(payload.data(), payload.size());
     } else {
-      encoded_data = encoded_buffer->encoded_data();
+      encoded_data = layer.payload;
     }
 
     EncodedImage encoded_image;
-    encoded_image._encodedWidth = encoded_buffer->width();
-    encoded_image._encodedHeight = encoded_buffer->height();
+    encoded_image._encodedWidth = layer.width;
+    encoded_image._encodedHeight = layer.height;
     encoded_image.SetRtpTimestamp(frame.rtp_timestamp());
     encoded_image.SetSimulcastIndex(0);
     encoded_image.ntp_time_ms_ = frame.ntp_time_ms();
@@ -297,7 +334,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
     encoded_image.rotation_ = frame.rotation();
     encoded_image.content_type_ = webrtc::VideoContentType::UNSPECIFIED;
     encoded_image.timing_.flags = webrtc::VideoSendTiming::kInvalid;
-    encoded_image._frameType = FrameTypeFromBuffer(encoded_buffer->frame_type());
+    encoded_image._frameType = FrameTypeFromBuffer(layer.frame_type);
     encoded_image.SetColorSpace(frame.color_space());
     const size_t encoded_size = encoded_data->size();
     encoded_image.SetEncodedData(std::move(encoded_data));
@@ -306,8 +343,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
 
     CodecSpecificInfo codec_info;
     codec_info.codecSpecific = {};
-    FillSingleLayerCodecSpecific(&codec_info, codec_type_, encoded_buffer->width(),
-                                 encoded_buffer->height(), is_keyframe,
+    FillSingleLayerCodecSpecific(&codec_info, codec_type_, layer.width,
+                                 layer.height, is_keyframe,
                                  &av1_svc_controller_);
 
     const auto result =
@@ -332,14 +369,15 @@ class PassthroughVideoEncoder final : public VideoEncoder {
     info.implementation_name = "LiveKit pre-encoded passthrough";
     info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
     info.is_hardware_accelerated = false;
+    info.has_trusted_rate_controller = true;
     info.supports_simulcast = false;
     info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNative};
     return info;
   }
 
  private:
-  void ForwardPendingRateControl(
-      EncodedVideoFrameBuffer* encoded_buffer) {
+  void ForwardPendingRateControl(EncodedVideoFrameBuffer* encoded_buffer,
+                                 size_t layer_index) {
     std::optional<livekit::EncodedRateControlRequest> request;
     {
       webrtc::MutexLock lock(&rate_control_mutex_);
@@ -347,8 +385,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
       latest_rate_control_request_.reset();
     }
     if (request.has_value()) {
-      encoded_buffer->set_rate_control_request(request->target_bitrate_bps,
-                                               request->framerate_fps);
+      encoded_buffer->set_rate_control_request(
+          layer_index, request->target_bitrate_bps, request->framerate_fps);
     }
   }
 
@@ -359,6 +397,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
   EncodedImageCallback* encoded_image_callback_ = nullptr;
   ScalableVideoControllerNoLayering av1_svc_controller_;
   std::vector<uint8_t> cached_sequence_header_obu_;
+  bool awaiting_keyframe_ = true;
+  uint64_t last_sequence_ = 0;
   webrtc::Mutex rate_control_mutex_;
   std::optional<livekit::EncodedRateControlRequest> latest_rate_control_request_;
 };

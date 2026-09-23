@@ -63,7 +63,7 @@ pub mod native {
         native::{DmaBufPixelFormat, NativeBuffer},
         FrameMetadata, VideoRotation,
     };
-    use crate::video_frame::{EncodedVideoFrame, VideoBuffer, VideoFrame};
+    use crate::video_frame::{EncodedSimulcastFrame, EncodedVideoFrame, VideoBuffer, VideoFrame};
 
     #[derive(Clone)]
     pub struct NativeVideoSource {
@@ -159,6 +159,32 @@ pub mod native {
         /// Captures one pre-encoded video access unit.
         pub fn capture_encoded_frame(&self, frame: &EncodedVideoFrame<'_>) -> bool {
             self.handle.capture_encoded_frame(frame)
+        }
+
+        /// Captures one pre-encoded frame of a simulcast track: an access
+        /// unit per layer, lowest first. libwebrtc runs a pass-through
+        /// encoder per layer and each sends its own layer.
+        pub fn capture_encoded_simulcast(&self, frame: &EncodedSimulcastFrame<'_>) -> bool {
+            self.handle.capture_encoded_simulcast(frame)
+        }
+
+        /// Like [`Self::take_keyframe_request`], for one simulcast layer.
+        pub fn take_layer_keyframe_request(&self, layer: usize) -> bool {
+            self.handle.take_layer_keyframe_request(layer)
+        }
+
+        /// Like [`Self::take_rate_control_request`], for one simulcast layer.
+        pub fn take_layer_rate_control_request(&self, layer: usize) -> Option<EncodedRateControl> {
+            self.handle.take_layer_rate_control_request(layer)
+        }
+
+        /// How long ago libwebrtc last asked for `layer`; `None` if never.
+        /// libwebrtc does not ask for a paused layer (no subscriber wants
+        /// it, or the bandwidth estimate left it no bitrate), so the
+        /// upstream encoder of a layer idle for a while can stop, and resume
+        /// with a keyframe when the layer is asked for again.
+        pub fn layer_idle(&self, layer: usize) -> Option<std::time::Duration> {
+            self.handle.layer_idle(layer)
         }
 
         /// Returns and clears the pending keyframe request raised by the

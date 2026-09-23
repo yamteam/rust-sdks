@@ -79,6 +79,10 @@ void AudioTrack::remove_sink(
   sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
 }
 
+void AudioTrack::set_volume(double volume) const {
+  track()->SetVolume(volume);
+}
+
 NativeAudioSink::NativeAudioSink(rust::Box<AudioSinkWrapper> observer,
                                  int sample_rate,
                                  int num_channels)

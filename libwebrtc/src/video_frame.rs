@@ -113,6 +113,32 @@ pub struct EncodedVideoFrame<'a> {
     pub frame_metadata: Option<FrameMetadata>,
 }
 
+/// One simulcast layer of a pre-encoded frame.
+#[derive(Debug, Clone)]
+pub struct EncodedLayer<'a> {
+    /// Encoded access-unit payload; empty when the layer was not encoded for
+    /// this frame (paused, or the upstream encoder dropped it).
+    pub payload: &'a [u8],
+    /// Encoded frame type.
+    pub frame_type: EncodedFrameType,
+    /// Layer resolution in pixels.
+    pub resolution: VideoResolution,
+}
+
+/// A pre-encoded frame with one access unit per simulcast layer, lowest layer
+/// first, matching the track's encodings.
+#[derive(Debug, Clone)]
+pub struct EncodedSimulcastFrame<'a> {
+    /// Encoded video codec, the same for every layer.
+    pub codec: EncodedVideoCodec,
+    /// Capture timestamp in microseconds.
+    pub timestamp_us: i64,
+    /// The layers, lowest first.
+    pub layers: &'a [EncodedLayer<'a>],
+    /// Optional metadata to attach through packet trailers.
+    pub frame_metadata: Option<FrameMetadata>,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl From<EncodedVideoCodec> for webrtc_sys::video_track::ffi::EncodedVideoCodec {
     fn from(value: EncodedVideoCodec) -> Self {
